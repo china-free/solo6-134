@@ -28,6 +28,9 @@ _HOP_BY_HOP = {
     "trailer",
     "transfer-encoding",
     "upgrade",
+}
+
+_STRIPPED_RESPONSE_HEADERS = _HOP_BY_HOP | {
     "content-length",
     "content-encoding",
 }
@@ -110,7 +113,7 @@ class _MockHandler(BaseHTTPRequestHandler):
         sent_ct = False
         for key, value in (headers or {}).items():
             kl = key.lower()
-            if kl in _HOP_BY_HOP:
+            if kl in _STRIPPED_RESPONSE_HEADERS:
                 continue
             if kl == "content-type":
                 sent_ct = True

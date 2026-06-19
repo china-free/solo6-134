@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import json
+import os
+import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -109,3 +113,109 @@ def test_yaml_rules_load_and_apply():
     mutator = Mutator(cfg)
     applied = mutator.mutate(_json_exchange({"id": 1, "name": "alice"}))
     assert applied.mutations
+
+
+def _make_compressed_har(body: dict, encoding: str = "gzip", extra_headers: list[dict] | None = None) -> Path:
+    raw = json.dumps(body).encode()
+    if encoding == "gzip":
+        compressed = gzip.compress(raw)
+    else:
+        compressed = raw
+    encoded = base64.b64encode(compressed).decode()
+    headers = [
+        {"name": "Content-Type", "value": "application/json"},
+        {"name": "Content-Encoding", "value": encoding},
+        {"name": "Transfer-Encoding", "value": "chunked"},
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
+    entry = {
+        "request": {
+            "method": "GET",
+            "url": "http://example.com/api/data",
+            "headers": [],
+        },
+        "response": {
+            "status": 200,
+            "headers": headers,
+            "content": {
+                "mimeType": "application/json",
+                "text": encoded,
+                "encoding": "base64",
+            },
+        },
+    }
+    har = {"log": {"entries": [entry]}}
+    fd, path_str = tempfile.mkstemp(suffix=".har")
+    os.close(fd)
+    tmp = Path(path_str)
+    tmp.write_text(json.dumps(har), encoding="utf-8")
+    return tmp
+
+
+def test_gzip_compressed_har_is_decompressed():
+    payload = {"id": 42, "name": "hello", "tags": ["a", "b"]}
+    path = _make_compressed_har(payload, encoding="gzip")
+    try:
+        exchanges = load_har(path)
+        assert len(exchanges) == 1
+        ex = exchanges[0]
+        assert ex.response_body.startswith(b"{")
+        parsed = json.loads(ex.response_body)
+        assert parsed == payload
+    finally:
+        path.unlink()
+
+
+def test_content_encoding_and_transfer_encoding_headers_removed():
+    payload = {"ok": True}
+    path = _make_compressed_har(payload, encoding="gzip")
+    try:
+        exchanges = load_har(path)
+        ex = exchanges[0]
+        header_names = {k.lower() for k in ex.response_headers}
+        assert "content-encoding" not in header_names
+        assert "transfer-encoding" not in header_names
+        assert "content-type" in header_names
+    finally:
+        path.unlink()
+
+
+def test_decompressed_json_body_can_be_mutated():
+    payload = {"id": 1, "name": "alice", "active": True}
+    path = _make_compressed_har(payload, encoding="gzip")
+    try:
+        exchanges = load_har(path)
+        ex = exchanges[0]
+        cfg = FuzzConfig(seed=7)
+        cfg.mutation_probability = 1.0
+        mutator = Mutator(cfg)
+        applied = mutator.mutate(ex)
+        assert applied.mutations
+        parsed = json.loads(applied.body)
+        assert isinstance(parsed, dict)
+    finally:
+        path.unlink()
+
+
+def test_identity_encoding_passes_through():
+    payload = {"x": 1}
+    path = _make_compressed_har(payload, encoding="identity")
+    try:
+        exchanges = load_har(path)
+        ex = exchanges[0]
+        # body was not gzip'd, so base64 of raw JSON should decode directly
+        parsed = json.loads(ex.response_body)
+        assert parsed == payload
+        header_names = {k.lower() for k in ex.response_headers}
+        assert "content-encoding" not in header_names
+    finally:
+        path.unlink()
+
+
+def test_server_response_omits_encoding_headers():
+    from fuzzmock.server import _STRIPPED_RESPONSE_HEADERS
+
+    assert "content-encoding" in _STRIPPED_RESPONSE_HEADERS
+    assert "transfer-encoding" in _STRIPPED_RESPONSE_HEADERS
+    assert "content-length" in _STRIPPED_RESPONSE_HEADERS
