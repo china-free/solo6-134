@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fuzzmock"
+version = "0.1.0"
+description = "CLI mock server that replays HAR-recorded responses with configurable fuzz mutations"
+requires-python = ">=3.9"
+dependencies = [
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+fuzzmock = "fuzzmock.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fuzzmock*"]
