@@ -219,3 +219,181 @@ def test_server_response_omits_encoding_headers():
     assert "content-encoding" in _STRIPPED_RESPONSE_HEADERS
     assert "transfer-encoding" in _STRIPPED_RESPONSE_HEADERS
     assert "content-length" in _STRIPPED_RESPONSE_HEADERS
+
+
+# ---- strategy registry / factory / custom strategies tests ----
+
+
+def test_default_registry_has_all_builtin_strategies():
+    from fuzzmock.strategies import default_registry
+
+    registry = default_registry()
+    for name in (
+        "empty",
+        "long_text",
+        "special_chars",
+        "unicode",
+        "format_string",
+        "sql_injection",
+        "null_bytes",
+        "control_chars",
+        "overflow_num",
+        "xss",
+        "regex_replace",
+        "wordlist",
+        "int_replace",
+        "int_range",
+        "int_normal",
+        "float_replace",
+        "bool_flip",
+        "null_replace",
+        "drop_field",
+    ):
+        assert registry.has(name), f"missing built-in strategy {name}"
+
+
+def test_strategy_factory_creates_parameterized_instance():
+    from fuzzmock.strategies import StrategyContext, default_registry
+    import random
+
+    registry = default_registry()
+    strat = registry.create("long_text", {"length": 17, "char": "Z"})
+    ctx = StrategyContext(rng=random.Random(0), config=None)
+    assert strat.apply("hello", ctx) == "Z" * 17
+
+
+def test_regex_replace_strategy_applies_pattern():
+    from fuzzmock.strategies import StrategyContext, default_registry
+    import random
+
+    registry = default_registry()
+    strat = registry.create("regex_replace", {"pattern": r"\d", "replacement": "#"})
+    ctx = StrategyContext(rng=random.Random(0), config=None)
+    assert strat.apply("abc123", ctx) == "abc###"
+
+
+def test_wordlist_strategy_picks_from_payloads():
+    from fuzzmock.strategies import StrategyContext, default_registry
+    import random
+
+    registry = default_registry()
+    words = ["alpha", "beta", "gamma"]
+    strat = registry.create("wordlist", {"words": words})
+    ctx = StrategyContext(rng=random.Random(0), config=None)
+    for _ in range(20):
+        assert strat.apply("anything", ctx) in words
+
+
+def test_custom_strategy_from_config_payload_inline():
+    from fuzzmock.config import load_config
+    from fuzzmock.strategies import build_registry_from_config
+    import tempfile, random
+    from fuzzmock.strategies import StrategyContext
+
+    yaml_text = (
+        "custom_strategies:\n"
+        "  - name: my_bad_string\n"
+        "    payload: '<<<<>>>>'\n"
+        "  - name: digits_to_x\n"
+        "    regex:\n"
+        "      pattern: '\\d'\n"
+        "      replacement: 'X'\n"
+        "  - name: some_users\n"
+        "    wordlist: [admin, root, guest]\n"
+        "strings:\n"
+        "  strategies:\n"
+        "    - my_bad_string\n"
+        "    - digits_to_x\n"
+        "    - some_users\n"
+    )
+    fd, p = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    Path(p).write_text(yaml_text, encoding="utf-8")
+    try:
+        cfg = load_config(p)
+        registry = build_registry_from_config(cfg.custom_strategies)
+        assert registry.has("my_bad_string")
+        assert registry.has("digits_to_x")
+        assert registry.has("some_users")
+        ctx = StrategyContext(rng=random.Random(1), config=None)
+        assert registry.create("my_bad_string").apply("x", ctx) == "<<<<>>>>"
+        assert registry.create("digits_to_x").apply("a1b2", ctx) == "aXbX"
+        chosen = registry.create("some_users").apply("x", ctx)
+        assert chosen in ["admin", "root", "guest"]
+    finally:
+        Path(p).unlink()
+
+
+def test_custom_strategy_via_python_module_import():
+    from fuzzmock.strategies import (
+        MutationStrategy,
+        StrategyContext,
+        build_registry_from_config,
+    )
+    import random, shutil, sys
+
+    tmpdir = Path(tempfile.mkdtemp())
+    mod_path = tmpdir / "my_strategies.py"
+    mod_path.write_text(
+        "from fuzzmock.strategies import MutationStrategy\n"
+        "class Rot13(MutationStrategy):\n"
+        "    name = 'rot13'\n"
+        "    target_types = (str,)\n"
+        "    def apply(self, value, context):\n"
+        "        import codecs\n"
+        "        return codecs.encode(str(value), 'rot_13')\n",
+        encoding="utf-8",
+    )
+    sys.path.insert(0, str(tmpdir))
+    try:
+        if "my_strategies" in sys.modules:
+            del sys.modules["my_strategies"]
+        custom = [{"name": "rot13", "module": "my_strategies:Rot13"}]
+        registry = build_registry_from_config(custom)
+        assert registry.has("rot13")
+        ctx = StrategyContext(rng=random.Random(0), config=None)
+        assert registry.create("rot13").apply("hello", ctx) == "uryyb"
+    finally:
+        if "my_strategies" in sys.modules:
+            del sys.modules["my_strategies"]
+        sys.path.pop(0)
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def test_mutator_uses_registered_custom_string_strategy():
+    from fuzzmock.config import FuzzConfig, StrategyRef
+    from fuzzmock.strategies import StrategyContext, StringMutationStrategy
+    from fuzzmock.mutators import Mutator
+
+    class FixedPayload(StringMutationStrategy):
+        name = "fixed_pw"
+
+        def apply(self, value, context):
+            return "PAYLOAD"
+
+    cfg = FuzzConfig(seed=0)
+    cfg.strings.strategies = [StrategyRef(name="fixed_pw")]
+    from fuzzmock.strategies import default_registry
+
+    reg = default_registry()
+    reg.register(FixedPayload)
+    mutator = Mutator(cfg, registry=reg)
+    ex = _json_exchange({"s": "original"})
+    applied = mutator.mutate(ex)
+    parsed = json.loads(applied.body)
+    assert parsed["s"] == "PAYLOAD"
+    assert any(m.strategy == "str_fixed_pw" for m in applied.mutations)
+
+
+def test_strategy_ref_parse_string_and_dict():
+    from fuzzmock.config import StrategyRef
+
+    a = StrategyRef.parse("empty")
+    assert a.name == "empty"
+    assert a.params == {}
+    b = StrategyRef.parse({"name": "long_text", "length": 42})
+    assert b.name == "long_text"
+    assert b.params == {"length": 42}

@@ -6,22 +6,14 @@ import threading
 from typing import Any
 from urllib.parse import parse_qs, urlencode
 
-from fuzzmock.config import FuzzConfig
+from fuzzmock.config import FuzzConfig, StrategyRef
 from fuzzmock.models import AppliedMutations, HttpExchange, Mutation
-
-
-_STRING_TABLE: dict[str, Any] = {
-    "empty": "",
-    "long_text": None,
-    "special_chars": "!@#$%^&*()_+-={}[]|\\:;\"'<>?,./`~",
-    "unicode": "\u00e9\u4e2d\u6587\U0001f600\U0001f4a9\u00c5\u00e6\u0153\u2211\u221e",
-    "format_string": "%n%n%n%s%s%s%d%d%d{x}{x}",
-    "sql_injection": "' OR '1'='1' -- ",
-    "null_bytes": "foo\x00bar\x00baz\x00",
-    "control_chars": "".join(chr(c) for c in range(1, 32)),
-    "overflow_num": "9" * 40,
-    "xss": "<script>alert(1)</script><img src=x onerror=alert(1)>",
-}
+from fuzzmock.strategies import (
+    MutationStrategy,
+    StrategyContext,
+    StrategyRegistry,
+    build_registry_from_config,
+)
 
 
 def _truncate(value: Any, max_len: int = 80) -> str:
@@ -34,11 +26,36 @@ def _truncate(value: Any, max_len: int = 80) -> str:
 
 
 class Mutator:
-    def __init__(self, config: FuzzConfig):
+    def __init__(self, config: FuzzConfig, registry: StrategyRegistry | None = None):
         self.config = config
+        self.registry: StrategyRegistry = registry or build_registry_from_config(
+            config.custom_strategies
+        )
         seed = config.seed
         self._rng = random.Random(seed)
         self._lock = threading.Lock()
+        self._context = StrategyContext(rng=self._rng, config=config)
+        self._string_strategies = self._build_cached_strategies(config.strings.strategies)
+        self._integer_strategies = self._build_cached_strategies(config.integers.strategies)
+        self._float_strategies = self._build_cached_strategies(config.floats.strategies)
+        self._bool_strategies = self._build_cached_strategies(config.booleans.strategies)
+        self._nullify_strategies = self._build_cached_strategies(config.nullify.strategies)
+
+    def _build_cached_strategies(
+        self, refs: list[StrategyRef]
+    ) -> list[tuple[MutationStrategy, str]]:
+        out: list[tuple[MutationStrategy, str]] = []
+        for ref in refs:
+            params = dict(ref.params)
+            if ref.name == "long_text" and "length" not in params:
+                params["length"] = self.config.strings.long_text_length
+            if ref.name == "int_replace" and "values" not in params:
+                params["values"] = list(self.config.integers.replacements)
+            if ref.name == "float_replace" and "values" not in params:
+                params["values"] = list(self.config.floats.replacements)
+            strategy = self.registry.create(ref.name, params)
+            out.append((strategy, ref.name))
+        return out
 
     def mutate(self, exchange: HttpExchange) -> AppliedMutations:
         with self._lock:
@@ -113,8 +130,20 @@ class Mutator:
             child = f"{path}.{key}"
             if self.config.drop_fields.enabled and not isinstance(value, (dict, list)):
                 if self._rng.random() < self.config.drop_fields.probability:
+                    ref = self.config.drop_fields.strategy
+                    try:
+                        strategy = self.registry.create(ref.name, ref.params)
+                        mutated = strategy.apply(value, self._context)
+                    except Exception:
+                        mutated = None
                     mutations.append(
-                        Mutation(child, type(value).__name__, "drop_field", _truncate(value), None)
+                        Mutation(
+                            child,
+                            type(value).__name__,
+                            ref.name,
+                            _truncate(value),
+                            _truncate(mutated) if mutated is not None else None,
+                        )
                     )
                     continue
             new_value, sub = self._mutate_value(value, child)
@@ -131,17 +160,29 @@ class Mutator:
             if strat == "huge":
                 base = obj[0] if obj else 0
                 huge = [base] * cfg.huge_size
-                return huge, [Mutation(path, "array", "array_huge", f"len={len(obj)}", f"len={cfg.huge_size}")]
+                return huge, [
+                    Mutation(path, "array", "array_huge", f"len={len(obj)}", f"len={cfg.huge_size}")
+                ]
             if strat == "null_element" and obj:
                 idx = self._rng.randrange(len(obj))
                 new_list = list(obj)
                 new_list[idx] = None
-                m = [Mutation(f"{path}[{idx}]", type(obj[idx]).__name__, "null_element", _truncate(obj[idx]), None)]
+                m = [
+                    Mutation(
+                        f"{path}[{idx}]",
+                        type(obj[idx]).__name__,
+                        "null_element",
+                        _truncate(obj[idx]),
+                        None,
+                    )
+                ]
                 new_list, sub = self._mutate_elements(new_list, path)
                 return new_list, m + sub
             if strat == "duplicate":
                 new_list, sub = self._mutate_elements(obj * 2, path)
-                return new_list, [Mutation(path, "array", "array_duplicate", f"len={len(obj)}", f"len={len(obj)*2}")] + sub
+                return new_list, [
+                    Mutation(path, "array", "array_duplicate", f"len={len(obj)}", f"len={len(obj)*2}")
+                ] + sub
         return self._mutate_elements(obj, path)
 
     def _mutate_elements(self, obj: list, path: str) -> tuple[list, list[Mutation]]:
@@ -156,22 +197,19 @@ class Mutator:
     def _mutate_leaf(self, value: Any, path: str) -> tuple[Any, list[Mutation]]:
         if value is None:
             if self.config.nullify.enabled and self._rng.random() < self.config.nullify.probability:
-                replacement = self._rng.choice(["null", 0, "", False, []])
-                return replacement, [Mutation(path, "null", "null_replace", None, _truncate(replacement))]
+                return self._apply_strategies(value, path, self._nullify_strategies, "null")
             return None, []
         if isinstance(value, bool):
             if self.config.booleans.enabled and self._maybe():
-                return (not value), [Mutation(path, "bool", "bool_flip", value, (not value))]
+                return self._apply_strategies(value, path, self._bool_strategies, "bool")
             return value, []
         if isinstance(value, int) and not isinstance(value, bool):
             if self.config.integers.enabled and self._maybe():
-                nv = self._rng.choice(self.config.integers.replacements)
-                return nv, [Mutation(path, "integer", "int_replace", value, nv)]
+                return self._apply_strategies(value, path, self._integer_strategies, "integer")
             return value, []
         if isinstance(value, float):
             if self.config.floats.enabled and self._maybe():
-                nv = self._rng.choice(self.config.floats.replacements)
-                return nv, [Mutation(path, "float", "float_replace", value, _truncate(nv))]
+                return self._apply_strategies(value, path, self._float_strategies, "float")
             return value, []
         if isinstance(value, str):
             if self.config.strings.enabled and self._maybe():
@@ -182,14 +220,40 @@ class Mutator:
         return value, []
 
     def _mutate_string(self, value: str, path: str) -> tuple[str, list[Mutation]]:
-        strat = self._rng.choice(self.config.strings.strategies)
-        if strat == "long_text":
-            nv = "A" * self.config.strings.long_text_length
-        else:
-            nv = _STRING_TABLE.get(strat, value)
-            if nv is None:
-                nv = "A" * self.config.strings.long_text_length
-        return nv, [Mutation(path, "string", f"str_{strat}", _truncate(value), _truncate(nv))]
+        if not self._string_strategies:
+            return value, []
+        idx = self._rng.randrange(len(self._string_strategies))
+        strategy, strat_name = self._string_strategies[idx]
+        if not strategy.can_handle(value):
+            return value, []
+        try:
+            mutated = strategy.apply(value, self._context)
+        except Exception:
+            return value, []
+        return str(mutated), [
+            Mutation(path, "string", f"str_{strat_name}", _truncate(value), _truncate(mutated))
+        ]
+
+    def _apply_strategies(
+        self,
+        value: Any,
+        path: str,
+        strategies: list[tuple[MutationStrategy, str]],
+        type_label: str,
+    ) -> tuple[Any, list[Mutation]]:
+        if not strategies:
+            return value, []
+        idx = self._rng.randrange(len(strategies))
+        strategy, strat_name = strategies[idx]
+        if not strategy.can_handle(value):
+            return value, []
+        try:
+            mutated = strategy.apply(value, self._context)
+        except Exception:
+            return value, []
+        return mutated, [
+            Mutation(path, type_label, strat_name, _truncate(value), _truncate(mutated))
+        ]
 
     def _type_confuse(self, value: Any, path: str) -> tuple[Any, list[Mutation]]:
         choice = self._rng.choice(["int_as_str", "str_as_int", "bool_as_int", "int_as_bool"])

@@ -8,36 +8,82 @@ mutation_probability: 1.0
 # RNG seed for reproducible runs. null = non-deterministic.
 seed: 42
 
+# ---------------------------------------------------------------------------
+# Custom strategies — register new strategies at startup.
+# Each entry becomes a named strategy you can reference below.
+#   - name:    strategy identifier, used in strategy lists
+#   - payload: fixed string payload (inherits from special_chars)
+#   - regex:   { pattern, replacement, count } — inherits from regex_replace
+#   - wordlist: [list of strings] — inherits from wordlist
+#   - module:  "path.to.module:ClassName" — import your own MutationStrategy subclass
+# ---------------------------------------------------------------------------
+custom_strategies:
+  - name: my_sql
+    payloads:
+      - "' OR 1=1 -- "
+      - "'; EXEC xp_cmdshell('dir'); --"
+      - "1' UNION SELECT username,password FROM users--"
+
+  - name: email_injection
+    payload: "attacker@example.com%0aCc:victim@example.com"
+
+  - name: mask_digits
+    regex:
+      pattern: "\\d"
+      replacement: "X"
+
+  - name: usernames
+    wordlist:
+      - admin
+      - "admin'--"
+      - root
+      - "<script>alert(1)</script>"
+
 integers:
   enabled: true
+  # Integer strategies accept simple name strings or {name, params} objects.
+  strategies:
+    - int_replace                                  # built-in, uses replacements below
+    - { name: int_range, min: -1000000, max: 1000000 }   # random integer in range
+    - { name: int_normal, mu: 0, sigma: 10000 }         # Gaussian distribution
   replacements: [0, -1, 2147483647, -2147483648, 4294967295, 999999999]
 
 floats:
   enabled: true
+  strategies:
+    - float_replace
   # inf / nan are intentionally non-standard JSON to stress parsers.
   replacements: [0.0, -1.0, .inf, -.inf, .nan, 1.0e308, -1.0e308]
 
 strings:
   enabled: true
   long_text_length: 100000
+  # Strategy references can be plain strings (no params) or {name, params} objects.
   strategies:
-    - empty            # ""
-    - long_text        # 'A' * long_text_length
-    - special_chars    # punctuation / symbols
-    - unicode          # multi-byte / emoji
-    - format_string    # %s %n style printf payloads
-    - sql_injection    # ' OR '1'='1' --
-    - null_bytes       # embedded \x00
-    - control_chars    # 0x01-0x1f
-    - overflow_num     # 40-digit numeric string
-    - xss              # <script>/<img onerror>
+    - empty                                         # ""
+    - { name: long_text, length: 100000, char: A }  # configurable long text
+    - special_chars                                 # punctuation / symbols
+    - unicode                                       # multi-byte / emoji
+    - format_string                                 # %s %n style printf payloads
+    - sql_injection                                 # built-in SQLi payloads
+    - my_sql                                        # custom strategy defined above
+    - email_injection                               # custom payload
+    - mask_digits                                   # custom regex-based
+    - usernames                                     # custom wordlist
+    - null_bytes                                    # embedded \x00
+    - control_chars                                 # 0x01-0x1f
+    - overflow_num                                  # 40-digit numeric string
+    - xss                                           # <script>/<img onerror>
 
 booleans:
-  enabled: true        # flip true <-> false
+  enabled: true
+  strategies:
+    - bool_flip        # flip true <-> false
 
 drop_fields:
-  enabled: true        # randomly drop JSON object keys
+  enabled: true
   probability: 0.3
+  strategy: drop_field  # the strategy used to signal a dropped key
 
 arrays:
   enabled: true
@@ -49,8 +95,10 @@ arrays:
     - null_element     # set one element to null
 
 nullify:
-  enabled: true        # replace existing nulls with a wrong type
+  enabled: true
   probability: 0.2
+  strategies:
+    - null_replace     # replace existing nulls with a wrong type
 
 type_confusion:
-  enabled: false       # int<->str<->bool swaps (off by default)
+  enabled: false        # int<->str<->bool swaps (off by default)
